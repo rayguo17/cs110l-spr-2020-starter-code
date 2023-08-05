@@ -1,3 +1,5 @@
+use std::ops::Index;
+
 use crate::debugger_command::DebuggerCommand;
 use crate::dwarf_data::{DwarfData, Error as DwarfError};
 use crate::inferior::Inferior;
@@ -10,6 +12,7 @@ pub struct Debugger {
     readline: Editor<()>,
     inferior: Option<Inferior>,
     dwarf_data: DwarfData,
+    break_points: Vec<usize>,
 }
 
 impl Debugger {
@@ -27,7 +30,7 @@ impl Debugger {
                 std::process::exit(1);
             }
         };
-
+        debug_data.print();
         let history_path = format!("{}/.deet_history", std::env::var("HOME").unwrap());
         //() is unit type, when we are doing something like println!() , we are implicitly returning () type.
         //here it means there has no helper or use default helper.
@@ -42,6 +45,7 @@ impl Debugger {
             readline,
             inferior: None,
             dwarf_data: debug_data,
+            break_points: Vec::new(),
         }
     }
 
@@ -59,35 +63,41 @@ impl Debugger {
                     if let Some(inferior) = Inferior::new(&self.target, &args) {
                         // Create the inferior
                         self.inferior = Some(inferior);
-                        // TODO (milestone 1): make the inferior run
-                        // You may use self.inferior.as_mut().unwrap() to get a mutable reference
-                        // to the Inferior object
                         let infer = self.inferior.as_mut().unwrap();
+                        for b in self.break_points.iter() {
+                            infer.breakpoint(b).unwrap();
+                        }
+
                         infer.goon().unwrap();
                         self.wait_thread();
-                        // match infer.wait(None) {
-                        //     Ok(status) => match status {
-                        //         crate::inferior::Status::Exited(exit_code) => {
-                        //             println!("Child exited (status {})", exit_code);
-                        //         }
-
-                        //         other => {
-                        //             println!("Unexpected status of child process.");
-                        //         }
-                        //     },
-                        //     Err(e) => println!("{}", e),
-                        // };
                     } else {
                         println!("Error starting subprocess");
                     }
                 }
-                DebuggerCommand::Continue => match &self.inferior {
-                    Some(infer) => match infer.goon() {
-                        Ok(status) => {
-                            self.wait_thread();
+                DebuggerCommand::Continue => match &mut self.inferior {
+                    //can we judge from here?
+                    Some(infer) => {
+                        match infer.find_break_point(&self.dwarf_data) {
+                            Some(addr) => {
+                                match infer.continue_from_breakpoint(&addr) {
+                                    Ok(a) => {}
+                                    Err(e) => {
+                                        println!("err when continue from breakpoint {}", e);
+                                    }
+                                };
+                                println!("found current location correspond with breakpoint.")
+                            }
+                            None => {
+                                println!("addr not found!");
+                            }
+                        };
+                        match infer.goon() {
+                            Ok(_status) => {
+                                self.wait_thread();
+                            }
+                            Err(_e) => {}
                         }
-                        Err(e) => {}
-                    },
+                    }
                     None => {
                         println!("Run the program first!");
                     }
@@ -110,15 +120,82 @@ impl Debugger {
                     }
                     return;
                 }
+                DebuggerCommand::Break(addr_str) => {
+                    let addr_usize = self.str_to_addr(addr_str).unwrap();
+                    // setup multiple kind of addr should interpret it to usize addr
+
+                    // let mut char_iter = arg.chars();
+                    // if char_iter.next().unwrap() == '*' {
+                    //     let remain = char_iter.as_str().to_string();
+                    //     return Some(DebuggerCommand::Break(remain));
+                    // }
+
+                    //first store the addr_usize into the break vec, should check contains first.
+                    if !self.break_points.contains(&addr_usize) {
+                        self.break_points.push(addr_usize.clone()); //ownership transfer??
+                    }
+                    //if already run program, we set the break point immediately
+                    if let Some(infer) = &mut self.inferior {
+                        //Error handling of error of break.
+                        println!("program exist, loading break points");
+                        infer.breakpoint(&addr_usize).expect("kill failed");
+                    }
+                    let mut index = 0;
+                    let mut cnt = 0;
+                    for pt in self.break_points.iter() {
+                        if *pt == addr_usize {
+                            index = cnt;
+                            break;
+                        }
+                        cnt = cnt + 1;
+                    }
+                    println!("Set breakpoint {} at {}", index, addr_usize);
+                }
             }
         }
     }
-
+    fn parse_address(&self, addr: &str) -> Option<usize> {
+        let addr_without_0x = if addr.to_lowercase().starts_with("0x") {
+            &addr[2..]
+        } else {
+            &addr
+        };
+        usize::from_str_radix(addr_without_0x, 16).ok()
+    }
+    fn str_to_addr(&self, str: String) -> Option<usize> {
+        match usize::from_str_radix(&str, 10) {
+            Ok(line) => match self.dwarf_data.get_addr_for_line(None, line) {
+                Some(addr) => {
+                    println!("addr from line: {}", addr);
+                    return Some(addr);
+                }
+                None => {}
+            },
+            Err(e) => {}
+        };
+        let mut char_iter = str.chars();
+        if char_iter.next().unwrap() == '*' {
+            let remain = char_iter.as_str().to_string();
+            return Some(self.parse_address(&remain).unwrap());
+        }
+        match self.dwarf_data.get_addr_for_function(None, &str) {
+            Some(addr) => {
+                return Some(addr);
+            }
+            None => {}
+        }
+        None
+    }
     fn wait_thread(&mut self) {
         let infer = self.inferior.as_ref().unwrap();
         match infer.wait(None).expect("encounter error when waiting") {
-            crate::inferior::Status::Stopped(signal, _) => {
+            crate::inferior::Status::Stopped(signal, instruction_ptr) => {
                 println!("Child stopped (signal {})", signal);
+                let line_number = self.dwarf_data.get_line_from_addr(instruction_ptr);
+                match line_number {
+                    Some(line) => println!("Stopped at {}", line),
+                    None => {}
+                }
             }
             crate::inferior::Status::Exited(exit_code) => {
                 println!("Child exited (status {})", exit_code);
