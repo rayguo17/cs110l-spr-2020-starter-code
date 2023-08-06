@@ -72,11 +72,48 @@ fn main() {
     let start = Instant::now();
 
     // TODO: call get_input_numbers() and store a queue of numbers to factor
+    let que = get_input_numbers();
+    //Arc for share ownership between different threads.
+    //Mutex for lock when accessing.
+    let queue = Arc::new(Mutex::new(que));
 
     // TODO: spawn `num_threads` threads, each of which pops numbers off the queue and calls
+    let mut threads = Vec::new();
+    for i in 0..num_threads {
+        //create a new handle pointing to exacly the same memory space.
+        let queue_handle = queue.clone();
+        threads.push(thread::spawn(move || {
+            worker(i, queue_handle);
+        }))
+    }
     // factor_number() until the queue is empty
 
     // TODO: join all the threads you created
+    for handle in threads {
+        handle.join().expect("Panic occured in thread!");
+    }
 
     println!("Total execution time: {:?}", start.elapsed());
+}
+
+fn worker(i: usize, queue: Arc<Mutex<VecDeque<u32>>>) {
+    //println!("Hello world!");
+    //a loop to get more item
+    loop {
+        //a helper function to avoid lock holding when processing data.
+        let val = que_helper(&queue);
+        match val {
+            Some(num) => {
+                println!("{}: {}", i, num);
+                factor_number(num);
+            }
+            None => {
+                return;
+            }
+        }
+    }
+}
+fn que_helper(que: &Arc<Mutex<VecDeque<u32>>>) -> Option<u32> {
+    let mut que_ref = que.lock().unwrap();
+    return que_ref.pop_back();
 }
