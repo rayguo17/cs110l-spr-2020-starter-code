@@ -71,27 +71,48 @@ fn main() {
     println!("Farm starting on {} CPUs", num_threads);
     let start = Instant::now();
 
-    // TODO: call get_input_numbers() and store a queue of numbers to factor
-    let que = get_input_numbers();
-    //Arc for share ownership between different threads.
-    //Mutex for lock when accessing.
-    let queue = Arc::new(Mutex::new(que));
-
-    // TODO: spawn `num_threads` threads, each of which pops numbers off the queue and calls
+    let (sender, receiver) = crossbeam::channel::unbounded();
     let mut threads = Vec::new();
-    for i in 0..num_threads {
-        //create a new handle pointing to exacly the same memory space.
-        let queue_handle = queue.clone();
+    for _ in 0..num_threads {
+        let receiver = receiver.clone();
         threads.push(thread::spawn(move || {
-            worker(i, queue_handle);
-        }))
+            while let Ok(next_num) = receiver.recv() {
+                factor_number(next_num);
+            }
+        }));
     }
-    // factor_number() until the queue is empty
+    let stdin = std::io::stdin();
+    for line in stdin.lines() {
+        let num = line.unwrap().parse::<u32>().unwrap();
+        sender
+            .send(num)
+            .expect("Tried writing to channel, but there are no receivers!");
+    }
+    drop(sender);
+    for thread in threads {
+        thread.join().expect("Panic ocurred in thread");
+    }
+    // // TODO: call get_input_numbers() and store a queue of numbers to factor
+    // let que = get_input_numbers();
+    // //Arc for share ownership between different threads.
+    // //Mutex for lock when accessing.
+    // let queue = Arc::new(Mutex::new(que));
 
-    // TODO: join all the threads you created
-    for handle in threads {
-        handle.join().expect("Panic occured in thread!");
-    }
+    // // TODO: spawn `num_threads` threads, each of which pops numbers off the queue and calls
+    // let mut threads = Vec::new();
+    // for i in 0..num_threads {
+    //     //create a new handle pointing to exacly the same memory space.
+    //     let queue_handle = queue.clone();
+    //     threads.push(thread::spawn(move || {
+    //         worker(i, queue_handle);
+    //     }))
+    // }
+    // // factor_number() until the queue is empty
+
+    // // TODO: join all the threads you created
+    // for handle in threads {
+    //     handle.join().expect("Panic occured in thread!");
+    // }
 
     println!("Total execution time: {:?}", start.elapsed());
 }
