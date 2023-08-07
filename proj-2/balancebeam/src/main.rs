@@ -1,60 +1,36 @@
+mod internal;
+
 mod request;
 mod response;
 
-use clap::Clap;
+use clap::Parser;
+use internal::proxy_status::{ProxyState, UpstreamStatus};
 use rand::{Rng, SeedableRng};
-use std::net::{TcpListener, TcpStream};
+use std::{
+    collections::HashMap,
+    net::{TcpListener, TcpStream},
+};
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
-#[derive(Clap, Debug)]
-#[clap(about = "Fun with load balancing")]
+#[derive(Parser, Debug)]
+#[command(about = "Fun with load balancing")]
 struct CmdOptions {
-    #[clap(
-        short,
-        long,
-        about = "IP/port to bind to",
-        default_value = "0.0.0.0:1100"
-    )]
+    // IP/port to bind to
+    #[arg(short, long, default_value = "0.0.0.0:1100")]
     bind: String,
-    #[clap(short, long, about = "Upstream host to forward requests to")]
+    // Upstream host to forward request to
+    #[arg(short, long)]
     upstream: Vec<String>,
-    #[clap(
-        long,
-        about = "Perform active health checks on this interval (in seconds)",
-        default_value = "10"
-    )]
+    // Perform active health checks on this interval (in seconds)
+    #[arg(long, default_value = "10")]
     active_health_check_interval: usize,
-    #[clap(
-    long,
-    about = "Path to send request to for active health checks",
-    default_value = "/"
-    )]
+    // "Path to send request to for active health checks"
+    #[arg(long, default_value = "/")]
     active_health_check_path: String,
-    #[clap(
-        long,
-        about = "Maximum number of requests to accept per IP per minute (0 = unlimited)",
-        default_value = "0"
-    )]
+    //"Maximum number of requests to accept per IP per minute (0 = unlimited)"
+    #[arg(long, default_value = "0")]
     max_requests_per_minute: usize,
-}
-
-/// Contains information about the state of balancebeam (e.g. what servers we are currently proxying
-/// to, what servers have failed, rate limiting counts, etc.)
-///
-/// You should add fields to this struct in later milestones.
-struct ProxyState {
-    /// How frequently we check whether upstream servers are alive (Milestone 4)
-    #[allow(dead_code)]
-    active_health_check_interval: usize,
-    /// Where we should send requests when doing active health checks (Milestone 4)
-    #[allow(dead_code)]
-    active_health_check_path: String,
-    /// Maximum number of requests an individual IP can make in a minute (Milestone 5)
-    #[allow(dead_code)]
-    max_requests_per_minute: usize,
-    /// Addresses of servers that we are proxying to
-    upstream_addresses: Vec<String>,
 }
 
 fn main() {
@@ -82,14 +58,24 @@ fn main() {
         }
     };
     log::info!("Listening for requests on {}", options.bind);
-
+    let mut upstream_status = HashMap::new();
+    for addr in options.upstream.clone() {
+        upstream_status.insert(
+            addr.clone(),
+            UpstreamStatus {
+                address: addr,
+                fail: false,
+            },
+        );
+    }
     // Handle incoming connections
-    let state = ProxyState {
-        upstream_addresses: options.upstream,
-        active_health_check_interval: options.active_health_check_interval,
-        active_health_check_path: options.active_health_check_path,
-        max_requests_per_minute: options.max_requests_per_minute,
-    };
+    let state = ProxyState::new(
+        options.active_health_check_interval,
+        options.active_health_check_path,
+        options.max_requests_per_minute,
+        options.upstream,
+        upstream_status,
+    );
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
             // Handle the connection!
@@ -99,19 +85,42 @@ fn main() {
 }
 
 fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> {
-    let mut rng = rand::rngs::StdRng::from_entropy();
-    let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
-    let upstream_ip = &state.upstream_addresses[upstream_idx];
-    TcpStream::connect(upstream_ip).or_else(|err| {
-        log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
-        Err(err)
-    })
+    //check the historical availablity
+    loop {
+        match state.select_random_updastream() {
+            Some(addr) => match TcpStream::connect(addr.clone()) {
+                Ok(conn) => {
+                    return Ok(conn);
+                }
+                Err(e) => {
+                    //notify this is not available.
+                    log::error!("Failed to connect to upstream {}: {}", addr, e);
+                }
+            },
+            None => {
+                break;
+            }
+        }
+
+        // .or_else(|err| {
+        //     log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
+        //     success = false;
+        // })
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "no upstream could be connected to",
+    ))
     // TODO: implement failover (milestone 3)
 }
 
 fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
-    log::info!("{} <- {}", client_ip, response::format_response_line(&response));
+    log::info!(
+        "{} <- {}",
+        client_ip,
+        response::format_response_line(&response)
+    );
     if let Err(error) = response::write_to_stream(&response, client_conn) {
         log::warn!("Failed to send response to client: {}", error);
         return;
@@ -177,7 +186,11 @@ fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
 
         // Forward the request to the server
         if let Err(error) = request::write_to_stream(&request, &mut upstream_conn) {
-            log::error!("Failed to send request to upstream {}: {}", upstream_ip, error);
+            log::error!(
+                "Failed to send request to upstream {}: {}",
+                upstream_ip,
+                error
+            );
             let response = response::make_http_error(http::StatusCode::BAD_GATEWAY);
             send_response(&mut client_conn, &response);
             return;
