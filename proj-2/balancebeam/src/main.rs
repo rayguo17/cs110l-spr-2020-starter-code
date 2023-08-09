@@ -4,12 +4,20 @@ mod request;
 mod response;
 
 use clap::Parser;
-use internal::proxy_status::{ProxyState, UpstreamStatus};
+use crossbeam_channel::{self, Receiver, Sender};
+use http::Request;
+use internal::proxy_status::{ProxyState, UpstreamUnit};
 use rand::{Rng, SeedableRng};
+use reqwest;
 use std::{
     collections::HashMap,
     net::{TcpListener, TcpStream},
+    sync::{Arc, Mutex},
+    thread::JoinHandle,
 };
+use std::{thread, time};
+
+use crate::internal::proxy_status::UpstreamStatus;
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -39,7 +47,7 @@ fn main() {
     // just looks a little prettier.
     if let Err(_) = std::env::var("RUST_LOG") {
         std::env::set_var("RUST_LOG", "debug");
-    }
+    } //seems like a universal way to enable logging even in library.
     pretty_env_logger::init();
 
     // Parse the command line arguments passed to this program
@@ -62,20 +70,38 @@ fn main() {
     for addr in options.upstream.clone() {
         upstream_status.insert(
             addr.clone(),
-            UpstreamStatus {
+            UpstreamUnit {
                 address: addr,
                 fail: false,
             },
         );
     }
+    let mut ups = Arc::new(Mutex::new(UpstreamStatus::new(
+        options.upstream.clone(),
+        upstream_status,
+    )));
     // Handle incoming connections
+    let (success_sender, success_receiver) = crossbeam_channel::unbounded();
+    let (fail_sender, fail_receiver) = crossbeam_channel::unbounded();
     let state = ProxyState::new(
         options.active_health_check_interval,
         options.active_health_check_path,
         options.max_requests_per_minute,
-        options.upstream,
-        upstream_status,
+        ups,
+        success_receiver.clone(),
+        fail_receiver.clone(),
     );
+    handle_active_health_check(
+        &state,
+        &success_sender,
+        &fail_sender,
+        &success_receiver,
+        &fail_receiver,
+    );
+    // channel to accept input ,
+    // create a background proxy status main thread.
+    // create another thread handling proxy status.
+
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
             // Handle the connection!
@@ -84,16 +110,75 @@ fn main() {
     }
 }
 
+fn handle_active_health_check(
+    state: &ProxyState,
+    ss: &Sender<String>,
+    fs: &Sender<String>,
+    sr: &Receiver<String>,
+    fr: &Receiver<String>,
+) -> Option<JoinHandle<()>> {
+    let options = state.get_option();
+    let suc = ss.clone();
+    let fail = fs.clone();
+    let handle = thread::spawn(move || {
+        active_check_routine(options, suc, fail);
+    });
+    let hc_handle = state.main_routine_invoker(sr, fr);
+    Some(handle)
+}
+
+fn active_check_routine(options: CmdOptions, ss: Sender<String>, fs: Sender<String>) {
+    //println!("{}", options.upstream[0]);
+    loop {
+        for up_addr in options.upstream.iter() {
+            //make a http request to path
+            let path = format!(
+                "http://{}{}",
+                up_addr.clone(),
+                options.active_health_check_path.clone()
+            );
+            let mut res = match reqwest::blocking::get(&path) {
+                Ok(res) => res,
+                Err(_e) => {
+                    log::debug!("Send request failed!");
+                    //fail send to channel
+                    fs.send(up_addr.to_string());
+                    continue;
+                }
+            };
+            let text = match res.text() {
+                Ok(res) => res,
+                Err(_e) => {
+                    //fail send to channel
+                    log::debug!("parse text failed!");
+                    fs.send(up_addr.to_string());
+                    continue;
+                }
+            };
+            ss.send(up_addr.to_string());
+            //println!("{}", text);
+            //success! send to channel
+        }
+        thread::sleep(time::Duration::from_secs(
+            options.active_health_check_interval as u64,
+        ));
+    }
+}
+fn handle_health_fail() {}
+fn handle_health_success() {}
+
 fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> {
     //check the historical availablity
     loop {
         match state.select_random_updastream() {
+            //how to build a long living connection?
             Some(addr) => match TcpStream::connect(addr.clone()) {
                 Ok(conn) => {
                     return Ok(conn);
                 }
                 Err(e) => {
                     //notify this is not available.
+                    state.noti_fail(&addr);
                     log::error!("Failed to connect to upstream {}: {}", addr, e);
                 }
             },
@@ -145,6 +230,7 @@ fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
     // The client may now send us one or more requests. Keep trying to read requests until the
     // client hangs up or we get an error.
     loop {
+        // PITFALL: does not solve the problem, outer connection might has been ended. SEND REQUEST TO UPSTREAM FAIL.
         // Read a request from the client
         let mut request = match request::read_from_stream(&mut client_conn) {
             Ok(request) => request,
