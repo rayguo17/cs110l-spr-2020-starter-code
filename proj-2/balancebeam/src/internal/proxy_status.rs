@@ -1,4 +1,5 @@
-use crossbeam_channel::{select, Receiver};
+use crate::CmdOptions;
+use crossbeam_channel::{select, Receiver, Sender};
 use rand::{Rng, SeedableRng};
 use std::{
     collections::HashMap,
@@ -7,7 +8,7 @@ use std::{
 };
 use std::{thread, time};
 
-use crate::CmdOptions;
+use super::client_status::{ClientManager, Command};
 /// Contains information about the state of balancebeam (e.g. what servers we are currently proxying
 /// to, what servers have failed, rate limiting counts, etc.)
 ///
@@ -30,6 +31,7 @@ pub struct ProxyState {
     //should add a channel both sender and receiver
     health_success_receiver: crossbeam_channel::Receiver<String>,
     health_fail_receiver: crossbeam_channel::Receiver<String>,
+    client_manager: ClientManager,
 }
 
 pub struct UpstreamUnit {
@@ -111,6 +113,7 @@ impl ProxyState {
             health_success_receiver: hsr,
             health_fail_receiver: hfr,
             _upstream_status: _us,
+            client_manager: ClientManager::new(),
         }
     }
     pub fn main_routine_invoker(
@@ -125,6 +128,14 @@ impl ProxyState {
             Self::main_routine_worker(ups, sr, fr);
         });
         return thread;
+    }
+    pub fn get_cm_cmd_sender(&self) -> Sender<Command> {
+        return self.client_manager.cmd_send.clone();
+    }
+    pub fn client_manager_main_routine_invoker(&self) -> JoinHandle<()> {
+        return self
+            .client_manager
+            .inner_routine_invoker(self.max_requests_per_minute);
     }
     pub fn valid_printer(ua: &Arc<Mutex<UpstreamStatus>>) {
         let uas = ua.lock().unwrap();

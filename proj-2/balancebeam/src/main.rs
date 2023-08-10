@@ -6,7 +6,11 @@ mod response;
 use clap::Parser;
 use crossbeam_channel::{self, Receiver, Sender};
 use http::Request;
-use internal::proxy_status::{ProxyState, UpstreamUnit};
+use internal::{
+    client_status::Command,
+    proxy_status::{ProxyState, UpstreamUnit},
+};
+
 use rand::{Rng, SeedableRng};
 use reqwest;
 use std::{
@@ -37,7 +41,7 @@ struct CmdOptions {
     #[arg(long, default_value = "/")]
     active_health_check_path: String,
     //"Maximum number of requests to accept per IP per minute (0 = unlimited)"
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value = "3")]
     max_requests_per_minute: usize,
 }
 
@@ -45,9 +49,9 @@ fn main() {
     // Initialize the logging library. You can print log messages using the `log` macros:
     // https://docs.rs/log/0.4.8/log/ You are welcome to continue using print! statements; this
     // just looks a little prettier.
-    if let Err(_) = std::env::var("RUST_LOG") {
-        std::env::set_var("RUST_LOG", "debug");
-    } //seems like a universal way to enable logging even in library.
+    // if let Err(_) = std::env::var("RUST_LOG") {
+    //     std::env::set_var("RUST_LOG", "debug");
+    // } //seems like a universal way to enable logging even in library.
     pretty_env_logger::init();
 
     // Parse the command line arguments passed to this program
@@ -98,16 +102,42 @@ fn main() {
         &success_receiver,
         &fail_receiver,
     );
+    let handle = state.client_manager_main_routine_invoker();
     // channel to accept input ,
     // create a background proxy status main thread.
     // create another thread handling proxy status.
 
     for stream in listener.incoming() {
+        //multithread start here?
+        //should use tokio,
         if let Ok(stream) = stream {
             // Handle the connection!
-            handle_connection(stream, &state);
+            //should take a look at stream first
+            let ip = stream.peer_addr().unwrap();
+            let ip_str = ip.ip().to_string();
+            println!("{}", ip_str);
+            if limit_checker(ip_str, state.get_cm_cmd_sender()) {
+                println!("success");
+                handle_connection(stream, &state);
+            } else {
+                println!("fail");
+                let mut stream = stream;
+                let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
+                send_response(&mut stream, &response);
+            }
         }
     }
+}
+
+fn limit_checker(ip: String, sender: Sender<Command>) -> bool {
+    let (res_sender, receiver) = crossbeam_channel::unbounded();
+    let cmd = Command {
+        res_send: res_sender,
+        cmd: ip,
+    };
+    sender.send(cmd).unwrap();
+    let res = receiver.recv().unwrap();
+    return res;
 }
 
 fn handle_active_health_check(
@@ -164,8 +194,6 @@ fn active_check_routine(options: CmdOptions, ss: Sender<String>, fs: Sender<Stri
         ));
     }
 }
-fn handle_health_fail() {}
-fn handle_health_success() {}
 
 fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> {
     //check the historical availablity
