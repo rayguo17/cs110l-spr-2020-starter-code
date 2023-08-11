@@ -10,24 +10,25 @@ use internal::{
     client_status::Command,
     proxy_status::{ProxyState, UpstreamUnit},
 };
-
 use rand::{Rng, SeedableRng};
 use reqwest;
 use std::{
     collections::HashMap,
     net::{TcpListener, TcpStream},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     thread::JoinHandle,
 };
 use std::{thread, time};
+use threadpool::ThreadPool;
 
 use crate::internal::proxy_status::UpstreamStatus;
+use crate::internal::worker_interface::WorkerInterface;
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
 #[derive(Parser, Debug)]
 #[command(about = "Fun with load balancing")]
-struct CmdOptions {
+pub struct CmdOptions {
     // IP/port to bind to
     #[arg(short, long, default_value = "0.0.0.0:1100")]
     bind: String,
@@ -41,7 +42,7 @@ struct CmdOptions {
     #[arg(long, default_value = "/")]
     active_health_check_path: String,
     //"Maximum number of requests to accept per IP per minute (0 = unlimited)"
-    #[arg(long, default_value = "3")]
+    #[arg(long, default_value = "0")]
     max_requests_per_minute: usize,
 }
 
@@ -49,9 +50,9 @@ fn main() {
     // Initialize the logging library. You can print log messages using the `log` macros:
     // https://docs.rs/log/0.4.8/log/ You are welcome to continue using print! statements; this
     // just looks a little prettier.
-    // if let Err(_) = std::env::var("RUST_LOG") {
-    //     std::env::set_var("RUST_LOG", "debug");
-    // } //seems like a universal way to enable logging even in library.
+    if let Err(_) = std::env::var("RUST_LOG") {
+        std::env::set_var("RUST_LOG", "debug");
+    } //seems like a universal way to enable logging even in library.
     pretty_env_logger::init();
 
     // Parse the command line arguments passed to this program
@@ -80,7 +81,7 @@ fn main() {
             },
         );
     }
-    let mut ups = Arc::new(Mutex::new(UpstreamStatus::new(
+    let mut ups = Arc::new(RwLock::new(UpstreamStatus::new(
         options.upstream.clone(),
         upstream_status,
     )));
@@ -106,6 +107,8 @@ fn main() {
     // channel to accept input ,
     // create a background proxy status main thread.
     // create another thread handling proxy status.
+    let num_threads = num_cpus::get();
+    let pool = ThreadPool::new(num_threads);
 
     for stream in listener.incoming() {
         //multithread start here?
@@ -113,20 +116,17 @@ fn main() {
         if let Ok(stream) = stream {
             // Handle the connection!
             //should take a look at stream first
-            let ip = stream.peer_addr().unwrap();
-            let ip_str = ip.ip().to_string();
-            println!("{}", ip_str);
-            if limit_checker(ip_str, state.get_cm_cmd_sender()) {
-                println!("success");
-                handle_connection(stream, &state);
-            } else {
-                println!("fail");
-                let mut stream = stream;
-                let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
-                send_response(&mut stream, &response);
-            }
+            let api = state.get_worker_interface();
+            pool.execute(move || {
+                worker(stream, api);
+            });
+            //handle_connection(stream, &state);
         }
     }
+}
+
+fn worker(client_conn: TcpStream, state: WorkerInterface) {
+    handle_connection(client_conn, state);
 }
 
 fn limit_checker(ip: String, sender: Sender<Command>) -> bool {
@@ -157,11 +157,16 @@ fn handle_active_health_check(
     Some(handle)
 }
 
+//should be a health check interface
 fn active_check_routine(options: CmdOptions, ss: Sender<String>, fs: Sender<String>) {
     //println!("{}", options.upstream[0]);
     loop {
+        thread::sleep(time::Duration::from_secs(
+            options.active_health_check_interval as u64,
+        ));
         for up_addr in options.upstream.iter() {
             //make a http request to path
+            println!("up_addr: {}", up_addr);
             let path = format!(
                 "http://{}{}",
                 up_addr.clone(),
@@ -172,33 +177,40 @@ fn active_check_routine(options: CmdOptions, ss: Sender<String>, fs: Sender<Stri
                 Err(_e) => {
                     log::debug!("Send request failed!");
                     //fail send to channel
+                    println!("Send request failed!");
                     fs.send(up_addr.to_string());
+
                     continue;
                 }
             };
+            println!("res success: {}", up_addr);
+            if res.status() != 200 {
+                log::debug!("parse text failed!");
+                //println!("Parse text failed!");
+                fs.send(up_addr.to_string());
+                continue;
+            }
             let text = match res.text() {
                 Ok(res) => res,
                 Err(_e) => {
                     //fail send to channel
                     log::debug!("parse text failed!");
+                    //println!("Parse text failed!");
                     fs.send(up_addr.to_string());
                     continue;
                 }
             };
             ss.send(up_addr.to_string());
-            //println!("{}", text);
+            println!("{} text: {}", up_addr, text);
             //success! send to channel
         }
-        thread::sleep(time::Duration::from_secs(
-            options.active_health_check_interval as u64,
-        ));
     }
 }
 
-fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> {
+fn connect_to_upstream(wi: &WorkerInterface) -> Result<TcpStream, std::io::Error> {
     //check the historical availablity
     loop {
-        match state.select_random_updastream() {
+        match wi.select_random_updastream() {
             //how to build a long living connection?
             Some(addr) => match TcpStream::connect(addr.clone()) {
                 Ok(conn) => {
@@ -206,7 +218,7 @@ fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> 
                 }
                 Err(e) => {
                     //notify this is not available.
-                    state.noti_fail(&addr);
+                    wi.noti_fail(&addr);
                     log::error!("Failed to connect to upstream {}: {}", addr, e);
                 }
             },
@@ -240,12 +252,20 @@ fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>
     }
 }
 
-fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
+fn handle_connection(mut client_conn: TcpStream, state: WorkerInterface) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
     log::info!("Connection received from {}", client_ip);
-
+    //do limit checking in here?
+    if limit_checker(client_ip.clone(), state.get_cm_cmd_sender()) {
+        println!("success");
+    } else {
+        println!("fail");
+        let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
+        send_response(&mut client_conn, &response);
+        return;
+    }
     // Open a connection to a random destination server
-    let mut upstream_conn = match connect_to_upstream(state) {
+    let mut upstream_conn = match connect_to_upstream(&state) {
         Ok(stream) => stream,
         Err(_error) => {
             let response = response::make_http_error(http::StatusCode::BAD_GATEWAY);
@@ -258,7 +278,7 @@ fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
     // The client may now send us one or more requests. Keep trying to read requests until the
     // client hangs up or we get an error.
     loop {
-        // PITFALL: does not solve the problem, outer connection might has been ended. SEND REQUEST TO UPSTREAM FAIL.
+        // PITFALL: outer connection might has been ended. SEND REQUEST TO UPSTREAM FAIL.
         // Read a request from the client
         let mut request = match request::read_from_stream(&mut client_conn) {
             Ok(request) => request,

@@ -3,12 +3,13 @@ use crossbeam_channel::{select, Receiver, Sender};
 use rand::{Rng, SeedableRng};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     thread::JoinHandle,
 };
 use std::{thread, time};
 
 use super::client_status::{ClientManager, Command};
+use super::worker_interface::WorkerInterface;
 /// Contains information about the state of balancebeam (e.g. what servers we are currently proxying
 /// to, what servers have failed, rate limiting counts, etc.)
 ///
@@ -26,7 +27,7 @@ pub struct ProxyState {
     /// Addresses of servers that we are proxying to
     // upstream_addresses: Vec<String>,
     // upstream_statuses: HashMap<String, UpstreamUnit>,
-    _upstream_status: Arc<Mutex<UpstreamStatus>>,
+    _upstream_status: Arc<RwLock<UpstreamStatus>>,
 
     //should add a channel both sender and receiver
     health_success_receiver: crossbeam_channel::Receiver<String>,
@@ -48,6 +49,7 @@ impl UpstreamStatus {
     pub fn new(ua: Vec<String>, us: HashMap<String, UpstreamUnit>) -> UpstreamStatus {
         UpstreamStatus { ua: ua, us: us }
     }
+
     pub fn select_random_updastream(&self) -> Option<String> {
         let mut rng = rand::rngs::StdRng::from_entropy();
         let upstream_idx = rng.gen_range(0, self.ua.len());
@@ -100,7 +102,7 @@ impl ProxyState {
         mrpm: usize,
         // ua: Vec<String>,
         // us: HashMap<String, UpstreamUnit>,
-        _us: Arc<Mutex<UpstreamStatus>>,
+        _us: Arc<RwLock<UpstreamStatus>>,
         hsr: crossbeam_channel::Receiver<String>,
         hfr: crossbeam_channel::Receiver<String>,
     ) -> ProxyState {
@@ -116,6 +118,12 @@ impl ProxyState {
             client_manager: ClientManager::new(),
         }
     }
+    pub fn get_worker_interface(&self) -> WorkerInterface {
+        return WorkerInterface::new(
+            self.client_manager.cmd_send.clone(),
+            self._upstream_status.clone(),
+        );
+    }
     pub fn main_routine_invoker(
         &self,
         sr: &Receiver<String>,
@@ -125,20 +133,18 @@ impl ProxyState {
         let sr = sr.clone();
         let fr = fr.clone();
         let thread = thread::spawn(move || {
-            Self::main_routine_worker(ups, sr, fr);
+            Self::health_check_worker(ups, sr, fr);
         });
         return thread;
     }
-    pub fn get_cm_cmd_sender(&self) -> Sender<Command> {
-        return self.client_manager.cmd_send.clone();
-    }
+
     pub fn client_manager_main_routine_invoker(&self) -> JoinHandle<()> {
         return self
             .client_manager
             .inner_routine_invoker(self.max_requests_per_minute);
     }
-    pub fn valid_printer(ua: &Arc<Mutex<UpstreamStatus>>) {
-        let uas = ua.lock().unwrap();
+    pub fn valid_printer(ua: &Arc<RwLock<UpstreamStatus>>) {
+        let uas = ua.read().unwrap();
         let que = uas.get_up_addrs();
         print!("valid addr:");
         for addr in que.iter() {
@@ -146,8 +152,8 @@ impl ProxyState {
         }
         println!("");
     }
-    pub fn main_routine_worker(
-        ua: Arc<Mutex<UpstreamStatus>>,
+    pub fn health_check_worker(
+        ua: Arc<RwLock<UpstreamStatus>>,
         sr: Receiver<String>,
         fr: Receiver<String>,
     ) {
@@ -161,7 +167,7 @@ impl ProxyState {
                         Ok(m)=>{
                             //log::debug!("in main routine_worker: {}",m);
                             //
-                            let mut ua = ua.lock().unwrap();
+                            let mut ua = ua.write().unwrap();
                             ua.noti_succ(&m);
                         },
                         Err(e)=>{
@@ -172,7 +178,7 @@ impl ProxyState {
                 recv(fr)->msg =>{
                     match msg {
                         Ok(m)=>{
-                            let mut ua = ua.lock().unwrap();
+                            let mut ua = ua.write().unwrap();
                             ua.noti_fail(&m);
                             //log::debug!("in main routine_worker: {}",m)
                         },
@@ -183,11 +189,11 @@ impl ProxyState {
                 }
             }
             //log::debug!("Health check on going!");
-            thread::sleep(time::Duration::from_secs(1));
+            //thread::sleep(time::Duration::from_secs(1));
         }
     }
     pub fn get_option(&self) -> CmdOptions {
-        let ups = self._upstream_status.lock().unwrap().get_up_addrs();
+        let ups = self._upstream_status.read().unwrap().get_up_addrs();
         return CmdOptions {
             bind: "".to_string(),
             upstream: ups,
@@ -195,15 +201,5 @@ impl ProxyState {
             active_health_check_path: self.active_health_check_path.clone(),
             max_requests_per_minute: self.max_requests_per_minute.clone(),
         };
-    }
-    pub fn select_random_updastream(&self) -> Option<String> {
-        return self
-            ._upstream_status
-            .lock()
-            .unwrap()
-            .select_random_updastream();
-    }
-    pub fn noti_fail(&self, us: &String) {
-        self._upstream_status.lock().unwrap().noti_fail(us);
     }
 }
